@@ -1,95 +1,156 @@
 # termux-god
 
-Конвертер образов **Xbox 360 ISO → формат GOD (Games On Demand)** для **Termux**.
-Это тонкая обёртка над отличной реализацией
-[`iliazeus/iso2god-rs`](https://github.com/iliazeus/iso2god-rs): установщик
-собирает её нативно прямо на телефоне, а команда `termux-god` добавляет удобный
-путь вывода, прогресс-бар и определение названия игры.
+Convert **Xbox 360 `.iso` disc images into the GOD (Games On Demand) format**,
+straight from your phone in **[Termux](https://termux.dev)**. No GUI, no
+Termux-X11, no APK — just one command in the terminal.
 
-Никакого GUI, Termux-X11 или APK — только команда в терминале Termux.
+`termux-god` is a thin wrapper around the excellent Rust tool
+[`iliazeus/iso2god-rs`](https://github.com/iliazeus/iso2god-rs): the installer
+builds it natively on the device, and the `termux-god` command adds a sensible
+default output path, a byte-based progress bar, and up-front title detection.
 
-## Требования
+---
 
-- Android + [Termux](https://f-droid.org/packages/com.termux/) (рекомендуется версия с F-Droid)
-- Доступ к общей памяти: один раз выполнить `termux-setup-storage`
-- ~2× свободного места от размера ISO (исходник + результат)
+## What GOD is and why this works
 
-## Установка
+An Xbox 360 reads "Games On Demand" titles from a USB/HDD as a package of
+plain files — no optical drive required. The console verifies integrity through
+a **tree of SHA-1 hashes**, so a GOD package is not just the raw ISO renamed; it
+has to be re-laid-out and re-hashed. That is exactly what the conversion does:
+
+| Layer | Size | Contains |
+|-------|------|----------|
+| **Block** | `0x1000` (4 KiB) | raw ISO data |
+| **Subpart** | 204 blocks | one hash table (SHA-1 per block) + 204 data blocks |
+| **Part** (`Data0000`, `Data0001`, …) | 203 subparts | a master hash table (MHT) + 203 subparts |
+
+The hashes chain upward: every block hash rolls into its subpart's hash table,
+every subpart table hash rolls into the part's master hash table (MHT), the MHTs
+of all parts are chained back-to-front, and the final top hash is written into
+the **CON header** — a ~`0xB000`-byte metadata blob (built from an
+`empty_live.bin` template) that carries the Title ID, Media ID, content type
+(`0x7000` = Games on Demand), the game name in UTF-16BE, an icon, and a SHA-1
+over its own payload. When the console recomputes this tree and it matches, the
+game is accepted. Get one byte or one offset wrong and the disc won't boot — which
+is the whole reason we don't reimplement it (see below).
+
+The ISO side uses the **XGD/GDF** layout (2048-byte sectors, a volume descriptor
+that locates the game partition's root offset). `--trim` walks the directory
+tree to find the highest sector actually used and drops the unused tail, so the
+output is smaller.
+
+All of the above — XGD/XEX parsing, the hash tree, the CON header template, trim,
+and the built-in Title-ID→name database — is implemented in **iso2god-rs**. This
+repo does **not** reimplement any of it.
+
+## What this repo adds
+
+`iso2god-rs` is a great Rust program but a raw `cargo` binary. `termux-god`
+makes it pleasant to use on a phone:
+
+- **`install.sh`** — builds iso2god-rs natively in Termux and installs it.
+- **`termux-god`** — a wrapper that supplies a default `/sdcard` output path,
+  checks storage access, shows title info before converting, and renders a clean
+  progress bar (upstream only prints `writing part files: N/M`).
+
+## Why it builds cleanly in Termux
+
+Rust installs in Termux with `pkg install rust`, and every **runtime** dependency
+of iso2god-rs is pure Rust (`anyhow`, `bitflags`, `byteorder`, `clap`,
+`num_enum`, `rayon`, `sha1`) — no C toolchain, no OpenSSL. The only heavy
+dependency, `reqwest` (which pulls in TLS and is painful to build on Android), is
+a **dev-dependency** used to regenerate the title database; `cargo build
+--release --bin iso2god` never compiles it. The upstream version we build is
+pinned in [`VERSION`](VERSION).
+
+---
+
+## Requirements
+
+- Android + [Termux](https://f-droid.org/packages/com.termux/) (the F-Droid
+  build is recommended)
+- Shared-storage access: run `termux-setup-storage` once
+- Roughly 2× the ISO size in free space (source + output)
+
+## Install
 
 ```bash
 pkg install -y git
-git clone <URL-этого-репозитория> termux-god
+git clone https://github.com/romanianmaniac/termux-god.git
 cd termux-god
 bash install.sh
 ```
 
-`install.sh` поставит `rust` и `git`, соберёт `iso2god` (закреплённая версия
-указана в [`VERSION`](VERSION)) и установит `termux-god` и `iso2god-bin` в
-`$PREFIX/bin`. Сетевые зависимости (`reqwest`/TLS) при сборке **не** компилируются.
+This installs `rust` and `git`, builds `iso2god`, and drops two commands into
+`$PREFIX/bin`: `iso2god-bin` (the upstream binary) and `termux-god` (the wrapper).
 
-## Использование
+## Usage
 
 ```bash
-termux-god <game.iso> [опции]
+termux-god <game.iso> [options]
 ```
 
-| Опция            | Что делает                                              |
-|------------------|--------------------------------------------------------|
-| `--trim`         | обрезать неиспользуемый хвост ISO (меньше размер)       |
-| `--out DIR`      | каталог вывода (по умолчанию `/sdcard/termux-god`)      |
-| `--threads N`    | число потоков (по умолчанию — число ядер CPU)          |
-| `--no-progress`  | не рисовать прогресс-бар                                |
-| `-h`, `--help`   | справка                                                 |
+| Option           | Description                                             |
+|------------------|---------------------------------------------------------|
+| `--trim`         | trim unused tail off the ISO (smaller output)           |
+| `--out DIR`      | output directory (default: `/sdcard/termux-god`)        |
+| `--threads N`    | worker threads (default: number of CPU cores)           |
+| `--no-progress`  | disable the progress bar                                |
+| `-h`, `--help`   | show help                                               |
 
-Пример:
+Example:
 
 ```bash
 termux-god /sdcard/Download/Halo3.iso --trim
 ```
 
-Вывод:
-
 ```
-▸ Читаю метаданные ISO…
+▸ Reading ISO metadata…
   Title ID: 4D5307E6
   Name:     Halo 3
   Type:     Games on Demand
-▸ Конвертирую → GOD…
-  [############################] 100%  готово
-✓ Готово: /sdcard/termux-god/4D5307E6
+▸ Converting → GOD…
+  [############################] 100%  done
+✓ Done: /sdcard/termux-god/4D5307E6
 ```
 
-## Результат и запуск на консоли
-
-Результат раскладывается так:
+## Output layout & running it on the console
 
 ```
-/sdcard/termux-god/<TitleID>/00007000/<MediaID>          ← CON-заголовок
+/sdcard/termux-god/<TitleID>/00007000/<MediaID>          ← CON header
 /sdcard/termux-god/<TitleID>/00007000/<MediaID>.data/    ← Data0000, Data0001 …
 ```
 
-Чтобы игра появилась на Xbox 360, скопируй папку `<TitleID>` целиком в:
+To make the console see the game, copy the whole `<TitleID>` folder to:
 
 ```
 Content/0000000000000000/<TitleID>/
 ```
 
-на USB-накопителе или HDD, отформатированном для консоли.
+on a USB drive or HDD formatted for the console.
 
-## Как это работает
+## How the wrapper works internally
 
-`termux-god`:
+1. Runs `iso2god-bin --dry-run` to read metadata and prints Title ID / name
+   (the name comes from iso2god-rs's built-in game database — nothing to maintain
+   here).
+2. Runs the conversion into an isolated temporary directory, hiding the upstream
+   output in a log and drawing its own progress bar from the number of bytes
+   written (denominator = source ISO size, so with `--trim` the bar honestly
+   reaches 100% only when the process finishes).
+3. On success, moves the finished `<TitleID>` folder into the output directory;
+   on error or `Ctrl+C`, a `trap` kills the worker and removes the partial output.
 
-1. читает метаданные через `iso2god-bin --dry-run` и печатает Title ID / название
-   (название берётся из встроенной в iso2god-rs базы игр);
-2. запускает конвертацию в изолированный временный каталог, пряча вывод
-   `iso2god` в лог и рисуя собственный прогресс-бар по объёму записанных данных;
-3. по завершении переносит готовую папку `<TitleID>` в каталог вывода, а при
-   ошибке/прерывании убирает частичный результат.
+## Default thread count
 
-## Благодарности
+Upstream defaults to a single thread (a safety choice for Windows and spinning
+hard drives). Phone storage is flash, so `termux-god` defaults `-j` to the number
+of CPU cores for a big speed-up. Override with `--threads N` if you prefer.
 
-Вся тяжёлая работа (разбор XGD/XEX, иерархическое SHA1-дерево, CON-заголовок,
-трим, база названий) — в [iso2god-rs](https://github.com/iliazeus/iso2god-rs)
-за авторством iliazeus, который сам является переписыванием
-[iso2god-cli](https://github.com/eliecharra/iso2god-cli).
+## Credits
+
+All the hard work — XGD/XEX parsing, the hierarchical SHA-1 tree, the CON header,
+trim, and the title database — belongs to
+[iso2god-rs](https://github.com/iliazeus/iso2god-rs) by **iliazeus**, itself a
+rewrite of [iso2god-cli](https://github.com/eliecharra/iso2god-cli). This repo is
+just the Termux packaging around it.
