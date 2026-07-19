@@ -1,5 +1,7 @@
 # termux-god
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 Convert **Xbox 360 `.iso` disc images into the GOD (Games On Demand) format**,
 straight from your phone in **[Termux](https://termux.dev)**. No GUI, no
 Termux-X11, no APK — just one command in the terminal.
@@ -154,3 +156,13 @@ trim, and the title database — belongs to
 [iso2god-rs](https://github.com/iliazeus/iso2god-rs) by **iliazeus**, itself a
 rewrite of [iso2god-cli](https://github.com/eliecharra/iso2god-cli). This repo is
 just the Termux packaging around it.
+
+## License
+
+This project (the `termux-god` wrapper and installer) is released under the
+[MIT License](LICENSE).
+
+The tool it builds, [iso2god-rs](https://github.com/iliazeus/iso2god-rs), is also
+MIT-licensed (© 2023 Ilia Pozdnyakov). It is **not** redistributed in this
+repository — `install.sh` fetches and builds it on the device — so the two
+licenses simply coexist, with no additional obligations.
