@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+#
+# termux-god — удобная обёртка Termux вокруг iso2god-bin (iso2god-rs).
+# Конвертирует Xbox 360 ISO → формат GOD и кладёт результат в /sdcard/termux-god.
+#
+set -uo pipefail
+
+BIN="${ISO2GOD_BIN:-iso2god-bin}"
+DEFAULT_OUT="/sdcard/termux-god"
+
+# ---------- вывод ------------------------------------------------------------
+c_info='\033[1;36m'; c_ok='\033[1;32m'; c_err='\033[1;31m'; c_dim='\033[2m'; c_off='\033[0m'
+info()  { printf "${c_info}▸${c_off} %s\n" "$*"; }
+ok()    { printf "${c_ok}✓${c_off} %s\n" "$*"; }
+die()   { printf "${c_err}✗${c_off} %s\n" "$*" >&2; exit 1; }
+
+usage() {
+    cat <<EOF
+termux-god — конвертер Xbox 360 ISO → GOD для Termux
+
+Использование:
+  termux-god <game.iso> [опции]
+
+Опции:
+  --trim              обрезать неиспользуемый хвост ISO (меньше размер)
+  --out DIR           куда сохранять (по умолчанию: $DEFAULT_OUT)
+  --threads N         число потоков (по умолчанию: число ядер)
+  --no-progress       не рисовать прогресс-бар
+  -h, --help          эта справка
+
+Результат: <out>/<TitleID>/00007000/<MediaID> (+ <MediaID>.data/Data0000…)
+Готовую папку <TitleID> скопируй в Content/0000000000000000/ на USB/HDD консоли.
+EOF
+}
+
+# ---------- разбор аргументов ------------------------------------------------
+ISO=""
+OUT="$DEFAULT_OUT"
+TRIM=0
+THREADS=""
+PROGRESS=1
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help)     usage; exit 0 ;;
+        --trim)        TRIM=1; shift ;;
+        --no-progress) PROGRESS=0; shift ;;
+        --out)         OUT="${2:-}"; [ -n "$OUT" ] || die "--out требует путь"; shift 2 ;;
+        --threads)     THREADS="${2:-}"; [ -n "$THREADS" ] || die "--threads требует число"; shift 2 ;;
+        --)            shift ;;
+        -*)            die "Неизвестная опция: $1 (см. --help)" ;;
+        *)             [ -z "$ISO" ] || die "Лишний аргумент: $1"; ISO="$1"; shift ;;
+    esac
+done
+
+[ -n "$ISO" ] || { usage; exit 1; }
+command -v "$BIN" >/dev/null 2>&1 || die "Не найден $BIN. Сначала запусти install.sh."
+[ -f "$ISO" ] || die "Файл не найден: $ISO"
+
+# ---------- проверка доступа к storage --------------------------------------
+case "$OUT" in
+    /sdcard/*|/storage/*)
+        if [ ! -d /sdcard ] && [ ! -d "$HOME/storage" ]; then
+            die "Нет доступа к общей памяти. Выполни один раз:  termux-setup-storage"
+        fi
+        ;;
+esac
+mkdir -p "$OUT" 2>/dev/null || die "Не могу создать каталог: $OUT"
+
+# ---------- утилиты ----------------------------------------------------------
+human() {
+    awk -v b="${1:-0}" 'BEGIN{
+        split("B KB MB GB TB", u, " "); s=b; i=1;
+        while (s>=1024 && i<5){ s/=1024; i++ }
+        if (i==1) printf "%d %s", s, u[i]; else printf "%.1f %s", s, u[i]
+    }'
+}
+
+dir_bytes() {  # суммарный размер файлов Data* внутри каталога $1
+    find "$1" -type f -name 'Data*' -printf '%s\n' 2>/dev/null \
+        | awk '{s+=$1} END{print s+0}'
+}
+
+draw_bar() {  # $1 = записано байт, $2 = всего байт
+    local cur="$1" total="$2" width=28 pct=0 filled i bar=''
+    if [ "$total" -gt 0 ] 2>/dev/null; then pct=$(( cur * 100 / total )); fi
+    [ "$pct" -gt 99 ] && pct=99          # 100% ставим только по завершении
+    filled=$(( pct * width / 100 ))
+    for ((i=0; i<width; i++)); do
+        if [ "$i" -lt "$filled" ]; then bar+='#'; else bar+='-'; fi
+    done
+    printf "\r  [%s] %3d%%  %s / %s   " "$bar" "$pct" "$(human "$cur")" "$(human "$total")"
+}
+
+# ---------- инфо о тайтле (dry-run) -----------------------------------------
+info "Читаю метаданные ISO…"
+DRY="$("$BIN" --dry-run "$ISO" "$OUT" 2>&1)" \
+    || die "Не удалось прочитать ISO:"$'\n'"$DRY"
+
+TITLE_ID="$(printf '%s\n' "$DRY" | sed -n 's/^Title ID:[[:space:]]*//p'      | head -n1)"
+NAME="$(    printf '%s\n' "$DRY" | sed -n 's/^[[:space:]]*Name:[[:space:]]*//p' | head -n1)"
+TYPE="$(    printf '%s\n' "$DRY" | sed -n 's/^[[:space:]]*Type:[[:space:]]*//p' | head -n1)"
+[ -n "$TITLE_ID" ] || die "Не удалось определить Title ID:"$'\n'"$DRY"
+
+printf "  ${c_dim}Title ID:${c_off} %s\n" "$TITLE_ID"
+printf "  ${c_dim}Name:    ${c_off} %s\n" "${NAME:-(unknown)}"
+printf "  ${c_dim}Type:    ${c_off} %s\n" "${TYPE:-?}"
+
+# ---------- конвертация в изолированный временный каталог --------------------
+RUNDIR="$OUT/.run.$$"
+LOG="$RUNDIR/.iso2god.log"
+SUCCESS=0
+mkdir -p "$RUNDIR"
+
+cleanup() {
+    [ "$SUCCESS" -eq 1 ] && return
+    # прибить фонового воркера, если жив, и снести частичный вывод
+    [ -n "${WORKER:-}" ] && kill "$WORKER" 2>/dev/null
+    rm -rf "$RUNDIR" 2>/dev/null
+}
+trap cleanup EXIT INT TERM
+
+# собрать аргументы бинаря
+args=()
+[ "$TRIM" -eq 1 ] && args+=(--trim)
+[ -n "$THREADS" ] && args+=(-j "$THREADS")
+# по умолчанию используем все ядра (upstream-дефолт = 1)
+if [ -z "$THREADS" ]; then
+    NPROC="$(nproc 2>/dev/null || echo 1)"
+    args+=(-j "$NPROC")
+fi
+
+info "Конвертирую → GOD…"
+TOTAL="$(stat -c %s "$ISO" 2>/dev/null || echo 0)"
+
+"$BIN" "${args[@]}" "$ISO" "$RUNDIR" >"$LOG" 2>&1 &
+WORKER=$!
+
+if [ "$PROGRESS" -eq 1 ]; then
+    while kill -0 "$WORKER" 2>/dev/null; do
+        draw_bar "$(dir_bytes "$RUNDIR")" "$TOTAL"
+        sleep 0.5
+    done
+fi
+
+rc=0
+wait "$WORKER" || rc=$?
+
+if [ "$PROGRESS" -eq 1 ]; then
+    # финальная строка бара на 100%
+    printf "\r  [%s] 100%%  готово%*s\n" "$(printf '#%.0s' $(seq 1 28))" 20 ""
+fi
+
+if [ "$rc" -ne 0 ]; then
+    printf '%s\n' "$c_err--- лог iso2god ---$c_off" >&2
+    tail -n 20 "$LOG" >&2 2>/dev/null
+    die "Конвертация завершилась с ошибкой (код $rc)."
+fi
+
+# ---------- перенос результата в финальное место ----------------------------
+TITLEDIR="$(find "$RUNDIR" -mindepth 1 -maxdepth 1 -type d ! -name '.*' | head -n1)"
+[ -n "$TITLEDIR" ] || die "Не найден результат конвертации в $RUNDIR (см. $LOG)"
+TID="$(basename "$TITLEDIR")"
+FINAL="$OUT/$TID"
+
+[ -e "$FINAL" ] && { info "Перезаписываю существующий $FINAL"; rm -rf "$FINAL"; }
+mv "$TITLEDIR" "$OUT/"
+
+SUCCESS=1
+rm -rf "$RUNDIR"
+
+ok "Готово: $FINAL"
+printf "  ${c_dim}Скопируй папку %s в Content/0000000000000000/ на накопителе консоли.${c_off}\n" "$TID"

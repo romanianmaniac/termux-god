@@ -1,0 +1,13 @@
+# большие образы — не коммитим
+*.iso
+*.data/
+
+# системный мусор
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# редакторы
+*.swp
+.idea/
+.vscode/

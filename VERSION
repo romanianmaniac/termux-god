@@ -1,0 +1,4 @@
+# Pinned upstream iso2god-rs release built by install.sh
+# https://github.com/iliazeus/iso2god-rs
+ISO2GOD_TAG=v1.8.1
+ISO2GOD_COMMIT=118495547cf687bd8cce21378f81283b8f4da7a2
